@@ -230,6 +230,14 @@ body {
   margin: 0;
 }
 
+.site-footer__note--remote {
+  color: #5c7c3d;
+}
+
+.site-footer__note--warn {
+  color: #8b6914;
+}
+
 @media (min-width: 480px) {
   .gift-card__row {
     flex-wrap: nowrap;
