@@ -1,22 +1,38 @@
 /**
  * Seznam dárků — uprav pole GIFTS (přidej/odeber řádky).
- * url: řetězec s odkazem nebo null, pokud odkaz není.
- * id: musí být unikátní (malá písmena, čísla, pomlčky).
  *
- * Sdílení mezi lidmi (bez Firebase):
- * - Nahraj stránku + sync.php na hosting s PHP, nebo spusť node server.mjs lokálně.
- * - Nastav REMOTE_SYNC.url na "sync.php" (stejná složka) nebo plnou adresu k sync.php.
- * - Volitelně stejný tajný klíč v REMOTE_SYNC.secret a v sync.php ($SYNC_SECRET).
+ * --- Nejrychlejší sdílení zaškrtnutí (bez PHP, bez Firebase) -----------------
+ * 1) Založ účet na https://jsonbin.io (zdarma).
+ * 2) V „API Keys“ zkopíruj $2 *X-Master-Key*.
+ * 3) Vytvoř nový Bin s obsahem:  {}
+ * 4) Zkopíruj *Bin ID* z adresy (část za /b/…).
+ * 5) Níže v JSONBIN_SYNC vlož binId a masterKey, soubor nahraj na web a otevři přes https.
+ *
+ * Kdokoli otevře stejnou stránku, uvidí stejná zaškrtnutí (obnovení cca každých pár sekund).
+ *
+ * BEZPEČNOST: Master key je v kódu stránky — vidí ho každý, kdo umí „Zobrazit zdroj“.
+ * Používej jen soukromý odkaz v rodině; veřejný web s tímto klíčem nedávej.
+ *
+ * Alternativa: REMOTE_SYNC.url + sync.php na hostingu s PHP (viz sync.php v projektu).
  */
 
 const STORAGE_KEY = "unicorn-gift-list-checked-v2";
 
 /**
- * Sdílení přes jednoduchý HTTP endpoint (sync.php nebo server.mjs).
- * url: "" → jen localStorage na tomto zařízení.
+ * JSONBin.io — vyplň obě pole pro sdílení. Nech prázdné = nepoužívá se.
+ * @see https://jsonbin.io
+ */
+const JSONBIN_SYNC = {
+  binId: "69e0858b36566621a8bbb3ee",
+  masterKey: "$2a$10$nFMqH3vS/mgmC2qI2.Cen.sRjmptSm9skFKATp4x3ElM8YBQjsszW",
+};
+
+/**
+ * Vlastní server (sync.php). Použije se jen pokud JSONBIN_SYNC není vyplněný.
+ * url: "" = nepoužívat HTTP API.
  */
 const REMOTE_SYNC = {
-  url: "sync.php",
+  url: "",
   secret: "",
   pollMs: 12000,
 };
@@ -88,11 +104,14 @@ function setsEqual(a, b) {
   return true;
 }
 
-function isRemoteConfigured() {
-  return typeof REMOTE_SYNC.url === "string" && REMOTE_SYNC.url.trim().length > 0;
+/** @returns {"jsonbin" | "http" | null} */
+function getRemoteBackend() {
+  if (JSONBIN_SYNC.binId.trim() && JSONBIN_SYNC.masterKey.trim()) return "jsonbin";
+  if (REMOTE_SYNC.url.trim()) return "http";
+  return null;
 }
 
-function syncRequestUrl() {
+function syncHttpUrl() {
   const raw = REMOTE_SYNC.url.trim();
   const base = /^https?:\/\//i.test(raw) ? raw : new URL(raw, window.location.href).href;
   const u = new URL(base);
@@ -177,8 +196,50 @@ function renderGiftList(checked) {
   });
 }
 
-async function fetchRemoteChecks() {
-  const res = await fetch(syncRequestUrl(), { cache: "no-store" });
+async function fetchJsonBinChecks() {
+  const binId = JSONBIN_SYNC.binId.trim();
+  const key = JSONBIN_SYNC.masterKey.trim();
+  const readUrl = `https://api.jsonbin.io/v3/b/${encodeURIComponent(binId)}/latest?meta=false`;
+  const res = await fetch(readUrl, {
+    headers: { "X-Master-Key": key },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error("JSONBin GET failed");
+  const data = await res.json();
+  if (!data || typeof data !== "object" || Array.isArray(data)) return new Set();
+  return checksObjectToSet(data);
+}
+
+async function postJsonBinCheck(id, checked) {
+  const binId = JSONBIN_SYNC.binId.trim();
+  const key = JSONBIN_SYNC.masterKey.trim();
+  const readUrl = `https://api.jsonbin.io/v3/b/${encodeURIComponent(binId)}/latest?meta=false`;
+  const readRes = await fetch(readUrl, {
+    headers: { "X-Master-Key": key },
+    cache: "no-store",
+  });
+  if (!readRes.ok) throw new Error("JSONBin read failed");
+  let data = await readRes.json();
+  if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
+  if (checked) data[id] = true;
+  else delete data[id];
+
+  const putUrl = `https://api.jsonbin.io/v3/b/${encodeURIComponent(binId)}`;
+  const putRes = await fetch(putUrl, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Master-Key": key,
+    },
+    body: JSON.stringify(data),
+    cache: "no-store",
+  });
+  if (!putRes.ok) throw new Error("JSONBin PUT failed");
+  return checksObjectToSet(data);
+}
+
+async function fetchHttpChecks() {
+  const res = await fetch(syncHttpUrl(), { cache: "no-store" });
   if (!res.ok) throw new Error("GET failed");
   const data = await res.json();
   if (!data || typeof data !== "object" || Array.isArray(data)) {
@@ -187,8 +248,8 @@ async function fetchRemoteChecks() {
   return checksObjectToSet(data);
 }
 
-async function postRemoteCheck(id, checked) {
-  const res = await fetch(syncRequestUrl(), {
+async function postHttpCheck(id, checked) {
+  const res = await fetch(syncHttpUrl(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id, checked }),
@@ -197,6 +258,24 @@ async function postRemoteCheck(id, checked) {
   const data = await res.json();
   if (!data || typeof data !== "object") throw new Error("bad response");
   return checksObjectToSet(data);
+}
+
+async function fetchRemoteChecks() {
+  const b = getRemoteBackend();
+  if (b === "jsonbin") return fetchJsonBinChecks();
+  if (b === "http") return fetchHttpChecks();
+  throw new Error("no remote backend");
+}
+
+async function postRemoteCheck(id, checked) {
+  const b = getRemoteBackend();
+  if (b === "jsonbin") return postJsonBinCheck(id, checked);
+  if (b === "http") return postHttpCheck(id, checked);
+  throw new Error("no remote backend");
+}
+
+function remoteLabel() {
+  return getRemoteBackend() === "jsonbin" ? "JSONBin.io" : "sync.php";
 }
 
 function startPolling() {
@@ -237,7 +316,7 @@ function onCheckboxChange(event) {
       })
       .catch(() => {
         setFooterMessage(
-          "Nepodařilo se uložit na server (sync.php). Zkontroluj připojení a adresu REMOTE_SYNC.url.",
+          `Nepodařilo se uložit (${remoteLabel()}). Zkontroluj klíč, Bin ID nebo internet.`,
           "warn"
         );
         fetchRemoteChecks()
@@ -257,22 +336,20 @@ function onCheckboxChange(event) {
 }
 
 async function initRemoteSync() {
-  setFooterMessage("Načítám sdílený seznam ze serveru…", "warn");
+  setFooterMessage("Načítám sdílený seznam…", "warn");
   try {
     const set = await fetchRemoteChecks();
     lastKnownRemoteSet = set;
     syncMode = "remote";
     renderGiftList(set);
-    setFooterMessage(
-      "Sdílený seznam — změny uvidí kdokoli se stejnou stránkou (API sync.php).",
-      "remote"
-    );
+    const src = getRemoteBackend() === "jsonbin" ? "JSONBin.io" : "sync.php";
+    setFooterMessage(`Sdílený seznam (${src}) — ostatní uvidí změny během pár sekund.`, "remote");
     startPolling();
   } catch (err) {
     console.error(err);
     syncMode = "local";
     setFooterMessage(
-      "Server pro sdílení nedostupný (zkus otevřít přes http, ne file://, a zkontroluj REMOTE_SYNC.url). Zatím jen toto zařízení.",
+      "Sdílení nefunguje (špatný Bin ID / klíč, nebo stránku otevři přes https, ne z disku). Zatím jen toto zařízení.",
       "warn"
     );
     renderGiftList();
@@ -280,21 +357,23 @@ async function initRemoteSync() {
 }
 
 function startApp() {
+  const backend = getRemoteBackend();
   const protocol = window.location.protocol;
-  if (isRemoteConfigured() && protocol !== "http:" && protocol !== "https:") {
+
+  if (backend && protocol !== "http:" && protocol !== "https:") {
     setFooterMessage(
-      "Pro sdílení otevři stránku přes http(s), ne jako soubor z disku — jinak prohlížeč API nezavolá.",
+      "Pro sdílení otevři stránku přes https (ne jako soubor z disku), jinak prohlížeč API blokuje.",
       "warn"
     );
     renderGiftList();
     return;
   }
 
-  if (isRemoteConfigured()) {
+  if (backend) {
     initRemoteSync();
   } else {
     setFooterMessage(
-      "Jen toto zařízení (localStorage). Pro sdílení nastav REMOTE_SYNC.url na sync.php a nahraj ho na web.",
+      "Jen toto zařízení. Pro sdílení: vyplň JSONBIN_SYNC v script.js (jsonbin.io) nebo REMOTE_SYNC.url (sync.php).",
       "warn"
     );
     renderGiftList();
